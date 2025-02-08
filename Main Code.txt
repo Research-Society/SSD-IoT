@@ -1,0 +1,81 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+import paho.mqtt.client as mqtt
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import Input, Conv2D, Reshape, Concatenate
+from tensorflow.keras.models import Model
+
+# MQTT Configuration for IoT Communication
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_TOPIC = "iot/object_detection"
+
+def on_connect(client, userdata, flags, rc):
+    print("Connected to MQTT Broker with result code", rc)
+    client.subscribe(MQTT_TOPIC)
+
+client = mqtt.Client()
+client.on_connect = on_connect
+client.connect(MQTT_BROKER, 1883, 60)
+
+# Load Pretrained SSD Base Model (MobileNetV2)
+base_model = MobileNetV2(input_shape=(300, 300, 3), include_top=False)
+
+# SSD Layers
+def ssd_head(x):
+    conv1 = Conv2D(512, (3, 3), activation='relu', padding='same')(x)
+    conv2 = Conv2D(256, (3, 3), activation='relu', padding='same')(conv1)
+    conf = Conv2D(6 * 2, (3, 3), padding='same')(conv2)  # Confidence scores
+    loc = Conv2D(6 * 4, (3, 3), padding='same')(conv2)   # Bounding boxes
+    conf = Reshape((-1, 2))(conf)
+    loc = Reshape((-1, 4))(loc)
+    return conf, loc
+
+# Extract Features from Multi-Scale Layers
+conf1, loc1 = ssd_head(base_model.output)
+conf2, loc2 = ssd_head(tf.keras.layers.GlobalAveragePooling2D()(base_model.output))
+
+# Final Predictions
+conf = Concatenate(axis=1)([conf1, conf2])
+loc = Concatenate(axis=1)([loc1, loc2])
+
+model = Model(inputs=base_model.input, outputs=[conf, loc])
+
+# Compile the Model
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss={'confidence': 'sparse_categorical_crossentropy', 'localization': 'mse'})
+
+# Function to Process Input Frames from IoT Camera
+def preprocess_frame(frame):
+    frame = cv2.resize(frame, (300, 300))
+    frame = frame / 255.0
+    return np.expand_dims(frame, axis=0)
+
+# Function to Perform Object Detection
+def detect_objects(frame):
+    processed_frame = preprocess_frame(frame)
+    conf_preds, loc_preds = model.predict(processed_frame)
+    return conf_preds, loc_preds
+
+# Function to Send Detection Data via MQTT
+def send_detection_data(conf, loc):
+    payload = {"confidence": conf.tolist(), "location": loc.tolist()}
+    client.publish(MQTT_TOPIC, str(payload))
+
+# Real-Time IoT Object Detection Loop
+cap = cv2.VideoCapture(0)  # Assuming IoT Camera
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    conf_preds, loc_preds = detect_objects(frame)
+    send_detection_data(conf_preds, loc_preds)
+    cv2.imshow("SSD IoT Detection", frame)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+client.disconnect()
